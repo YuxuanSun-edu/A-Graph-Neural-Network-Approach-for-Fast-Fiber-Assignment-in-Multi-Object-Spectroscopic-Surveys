@@ -140,31 +140,43 @@ class ProblemInstance:
         
         print(f"   -> [Graph] Nodes: {len(self.nodes)}, Conflict Edges: {sum(len(v) for v in self.conflict_adj.values())//2}")
 
-# ================= 3. 论文核心算法: Netflow + Retreat =================
 def solve_paper_baseline(instance: ProblemInstance):
     """
-    复现思路：
-    Stage 1: 构建二部图网络流 (Source -> Star -> Fiber -> Sink)。
-             这一步解决“分配”问题，忽略物理碰撞。
+    带边截断优化的两阶段法：
+    Stage 1: 构建网络流图前，对每根光纤视野内的天体按权重排序，只保留 Top-K 连线，防止低分天体抢占流量。
     Stage 2: 基于优先级的 Retreat。
-             这一步解决“冲突”问题，丢弃低分目标。
     """
     
-    # --- Stage 1: 构建流网络 ---
     print("   -> [Stage 1] 构建网络流图...")
     G = nx.DiGraph()
     SOURCE = 'SOURCE'
     SINK = 'SINK'
-    
-    # 我们不预先 add_node，直接 add_edge 更快
     edge_to_nid = {}
     
-    # 为了避免字符串拼接带来的巨大内存开销，我们使用元组或整数作为中间节点
-    # 但为了逻辑清晰，这里还是用字符串
-    
+    # ---------------- 核心抢救逻辑：Fiber 到 Star 的反向映射 ----------------
+    fiber_to_stars = defaultdict(list)
     for nid in instance.nodes:
         info = instance.node_info[nid]
-        # 加前缀防止重名
+        fiber_part = info['fiber']
+        weight = instance.weights[nid]
+        # 记录每根 Fiber 能看到的节点及其权重
+        fiber_to_stars[fiber_part].append((nid, weight))
+    
+    # 对每根 Fiber，只保留权重最高的 Top-K 个连接（这里 K 设为 1 或 2，效果最好）
+    # 你可以调整 TOP_K 的值，K=1 相当于极其贪心，K=2 给最大流留一点选择空间
+    TOP_K = 2 
+    valid_nids = set()
+    for fiber_part, stars in fiber_to_stars.items():
+        # 按权重从大到小排序
+        stars.sort(key=lambda x: x[1], reverse=True)
+        # 只把前 K 个放入有效候选池
+        for nid, w in stars[:TOP_K]:
+            valid_nids.add(nid)
+    # -------------------------------------------------------------------------
+
+    # 现在，只拿这些被过滤过的高优节点去建图
+    for nid in valid_nids:
+        info = instance.node_info[nid]
         star_node = f"S:{info['star']}"
         fiber_node = f"F:{info['fiber']}"
         
@@ -172,7 +184,6 @@ def solve_paper_baseline(instance: ProblemInstance):
         G.add_edge(SOURCE, star_node, capacity=1.0)
         
         # Star -> Fiber (Capacity 1)
-        # 这条边代表选择了这个观测 Item
         G.add_edge(star_node, fiber_node, capacity=1.0)
         edge_to_nid[(star_node, fiber_node)] = nid
         
@@ -183,8 +194,6 @@ def solve_paper_baseline(instance: ProblemInstance):
     
     t_flow_start = time.time()
     try:
-        # 【核心修改】使用 preflow_push，它在大规模图上比 edmonds_karp 快得多
-        # 也可以尝试 flow_func=nx.algorithms.flow.shortest_augmenting_path
         flow_value, flow_dict = nx.maximum_flow(
             G, SOURCE, SINK, 
             flow_func=nx.algorithms.flow.preflow_push
@@ -197,11 +206,8 @@ def solve_paper_baseline(instance: ProblemInstance):
 
     # --- 提取 Stage 1 结果 ---
     stage1_solution = []
-    # 遍历流字典提取结果
-    # flow_dict[u][v] == 1.0 表示选中
-    # 只需要看 Star -> Fiber 的边
     for u, neighbors in flow_dict.items():
-        if u.startswith("S:"): # 只看 Star 节点发出的流
+        if u.startswith("S:"):
             for v, flow in neighbors.items():
                 if flow > 0.9 and v.startswith("F:"):
                     if (u, v) in edge_to_nid:
@@ -210,22 +216,13 @@ def solve_paper_baseline(instance: ProblemInstance):
     print(f"   -> [Stage 1] 初步分配: {len(stage1_solution)} 个观测 (含冲突)")
 
     # --- Stage 2: Retreat (冲突消解) ---
-    # 按照权重从大到小排序，贪心保留
     print("   -> [Stage 2] 执行 Retreat (冲突消解)...")
-    
     stage1_solution.sort(key=lambda x: instance.weights[x], reverse=True)
     
     final_solution = set()
-    blocked_nodes = set() # 用 set 查重比遍历快
     
     for nid in stage1_solution:
-        # 检查是否与已选中的点有冲突
-        # 注意：这里只需要检查 nid 的冲突邻居是否已经在 final_solution 中
         is_conflict = False
-        
-        # 快速检查
-        # 只要 nid 的任何邻居被选中了，nid 就不能选
-        # 优化：遍历 conflict_adj[nid]
         for neighbor in instance.conflict_adj[nid]:
             if neighbor in final_solution:
                 is_conflict = True
@@ -236,7 +233,6 @@ def solve_paper_baseline(instance: ProblemInstance):
             
     total_w = sum(instance.weights[n] for n in final_solution)
     return final_solution, total_w
-
 # ================= 4. 保存与主程序 =================
 def save_solution(filename, solution_set, total_weight, instance):
     with open(filename, 'w', encoding='utf-8') as f:
@@ -246,7 +242,7 @@ def save_solution(filename, solution_set, total_weight, instance):
             f.write(f"{key}: Selected\n")
 
 def main():
-    base_dir = r"C:\Users\89328\Desktop\demo\match_map_3600"
+    base_dir = r"C:\Users\LabPC\Desktop\demo\match_map_3600"
     csv_file_path = os.path.join(base_dir, "PaperBaseline_Performance.csv")
     
     if not os.path.exists(base_dir):
